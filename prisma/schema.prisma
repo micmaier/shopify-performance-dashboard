@@ -1,0 +1,75 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/**
+ * Ein Shop (z.B. "local", Domain etc.)
+ */
+model Shop {
+  id        String   @id @default(cuid())
+  name      String
+  domain    String?
+  orders    Order[]
+  createdAt DateTime @default(now())
+}
+
+/**
+ * Eine Bestellung (Aggregat über Positionen)
+ */
+model Order {
+  id        String   @id @default(cuid())
+  shop      Shop     @relation(fields: [shopId], references: [id])
+  shopId    String
+  name      String // z.B. "#1358"
+  createdAt DateTime // Bestelldatum
+  segment   String? // "b2c" | "b2b" | "platform" | "unknown"
+
+  grossSales Decimal @default(0) // Bruttoumsatz ohne Steuer
+  discounts  Decimal @default(0)
+  returns    Decimal @default(0)
+  netRevenue Decimal @default(0) // Nettoumsatz nach Rabatten/Rückgaben
+  tax        Decimal @default(0)
+  total      Decimal @default(0) // Gesamt inkl Steuer
+  cogs       Decimal @default(0) // Wareneinsatz / COGS für gesamte Order
+
+  items OrderItem[]
+
+  // Flags / Convenience
+  newCustomer Boolean? // optional: ob Erstkauf
+
+  @@index([shopId, createdAt])
+  @@index([segment])
+}
+
+/**
+ * Einzelne Produktzeile aus der Bestellung
+ */
+model OrderItem {
+  id      String @id @default(cuid())
+  order   Order  @relation(fields: [orderId], references: [id])
+  orderId String
+
+  productTitle String
+  variantTitle String
+  sku          String?
+
+  quantity Int
+  gross    Decimal @default(0)
+  discount Decimal @default(0)
+  net      Decimal @default(0)
+  cogs     Decimal @default(0)
+
+  // kategorisierte Felder
+  category String? // "Wandfarbe", "Lack", "Grundierung", "Farbmuster", Zubehör, etc.
+  size     String? // "1L", "2.5L", "10L", "0.75L", ...
+
+  @@index([orderId])
+  @@index([category, size])
+}

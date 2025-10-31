@@ -6,9 +6,12 @@ import {
   getNetKpis,
   getNetRevenueSplit,
   getNetRevenueLastNMonths,
+  getSegmentStats,
 } from "@/lib/kpis";
 import DateRangePicker from "@/components/DateRangePicker";
 import BarSeries from "@/components/BarSeries";
+import EbitdaTable from "@/components/EbitdaTable";
+import { getEbitdaByMonth, sumRows } from "@/lib/ebitda";
 
 function eur(n: number | null | undefined) {
   return new Intl.NumberFormat("de-DE", {
@@ -37,13 +40,38 @@ export default async function Dashboard({
 
   const range = parseRangeFromSearch(searchParams);
 
-  const [totals, split, last12] = await Promise.all([
+  // Alle KPIs & Segment-Stats in EINEM Promise.all laden
+  const [
+    totals,
+    split,
+    last12,
+    b2cStats,
+    b2bStats,
+    platformStats,
+  ] = await Promise.all([
     getNetKpis(shop.id, range),
     getNetRevenueSplit(shop.id, range),
     getNetRevenueLastNMonths(shop.id, 12, range.to),
+    getSegmentStats(shop.id, "b2c", range),
+    getSegmentStats(shop.id, "b2b", range),
+    getSegmentStats(shop.id, "platform", range),
   ]);
 
+  // Zahlformat-Helfer
+  const int = (n: number) =>
+    new Intl.NumberFormat("de-DE").format(Math.round(n));
+
   const untilDay = new Date(range.to.getTime() - 24 * 3600 * 1000);
+
+  // >>> EBITDA: hier VOR dem return berechnen
+  const thisYear = new Date().getFullYear();
+  const [ebitdaThis, ebitdaPrev] = await Promise.all([
+    getEbitdaByMonth(shop.id, thisYear),
+    getEbitdaByMonth(shop.id, thisYear - 1),
+  ]);
+  const prevTotals = sumRows(ebitdaPrev);
+  // <<<
+
 
   return (
     <div className="space-y-6 text-slate-100">
@@ -84,15 +112,34 @@ export default async function Dashboard({
         <div className="border border-slate-700 rounded p-3">
           <div className="text-xs text-slate-400">B2C</div>
           <div className="text-lg font-semibold">{eur(split.b2c)}</div>
+          <div className="mt-2 grid grid-cols-3 gap-2 text-[11px] text-slate-300">
+            <div><div className="text-slate-400">#Customers</div><div className="font-semibold">{int(b2cStats.uniqueCustomers)}</div></div>
+            <div><div className="text-slate-400">Basket Size</div><div className="font-semibold">{eur(b2cStats.basketSize)}</div></div>
+            <div><div className="text-slate-400">Order Freq.</div><div className="font-semibold">{b2cStats.orderFrequency.toFixed(2)}</div></div>
+          </div>
         </div>
         <div className="border border-slate-700 rounded p-3">
           <div className="text-xs text-slate-400">Mynt Pro</div>
           <div className="text-lg font-semibold">{eur(split.b2b)}</div>
+          <div className="mt-2 grid grid-cols-3 gap-2 text-[11px] text-slate-300">
+            <div><div className="text-slate-400">#New</div><div className="font-semibold">{int(b2bStats.newCustomers)}</div></div>
+            <div><div className="text-slate-400">#Existing</div><div className="font-semibold">{int(b2bStats.existingCustomers)}</div></div>
+            <div><div className="text-slate-400">#Total</div><div className="font-semibold">{int(b2bStats.uniqueCustomers)}</div></div>
+            <div><div className="text-slate-400">Basket Size</div><div className="font-semibold">{eur(b2bStats.basketSize)}</div></div>
+            <div><div className="text-slate-400">Order Freq.</div><div className="font-semibold">{b2bStats.orderFrequency.toFixed(2)}</div></div>
+          </div>
         </div>
-        <div className="border border-slate-700 rounded p-3">
-          <div className="text-xs text-slate-400">Projects</div>
-          <div className="text-lg font-semibold">{eur(split.platform)}</div>
+       <div className="border border-slate-700 rounded p-3">
+        <div className="text-xs text-slate-400">Projects</div>
+        <div className="text-lg font-semibold">{eur(split.platform)}</div>
+        <div className="mt-2 grid grid-cols-3 gap-2 text-[11px] text-slate-300">
+          <div><div className="text-slate-400">#New</div><div className="font-semibold">{int(platformStats.newCustomers)}</div></div>
+          <div><div className="text-slate-400">#Existing</div><div className="font-semibold">{int(platformStats.existingCustomers)}</div></div>
+          <div><div className="text-slate-400">#Total</div><div className="font-semibold">{int(platformStats.uniqueCustomers)}</div></div>
+          <div><div className="text-slate-400">Basket Size</div><div className="font-semibold">{eur(platformStats.basketSize)}</div></div>
+          <div><div className="text-slate-400">Order Freq.</div><div className="font-semibold">{platformStats.orderFrequency.toFixed(2)}</div></div>
         </div>
+      </div>
         <div className="border border-slate-700 rounded p-3">
           <div className="text-xs text-slate-400">Unklar</div>
           <div className="text-lg font-semibold">{eur(split.unknown)}</div>
@@ -107,9 +154,17 @@ export default async function Dashboard({
         <BarSeries data={last12.map((m) => ({ month: m.month, net: m.net }))} />
       </section>
 
+      {/* EBITDA-Breakdown (transponiert & gruppiert) */}
+      <EbitdaTable
+        year={thisYear}
+        current={ebitdaThis}
+        previous={ebitdaPrev}
+        previousTotals={prevTotals}
+      />
+
       <p className="text-slate-500 text-xs">
-        Basis: Order-Felder grossSales, discounts, returns, netRevenue, cogs.
-        Zeitraum wirkt auf alle Kacheln & Split.
+        Basis: Order-Felder grossSales, discounts, returns, netRevenue, cogs. Shipping Charges
+        sind aktuell Platzhalter (0 €). Zeitraum wirkt auf alle Kacheln & Split.
       </p>
     </div>
   );

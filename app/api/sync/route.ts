@@ -1,143 +1,271 @@
 // app/api/sync/route.ts
 import { NextResponse } from "next/server";
 import { PrismaClient } from "@prisma/client";
-import { fetchOrdersSince, classifyLine, toDec } from "@/lib/shopify";
+import { getCOGSForSku, getCOGSForFallback } from "@/lib/cogs";
+import { classifyCategoryAndSize } from "@/lib/classify";
 
 const prisma = new PrismaClient();
 
-export async function GET(request: Request) {
-  try {
-    const url = new URL(request.url);
-    const since = url.searchParams.get("since"); // z.B. 2024-01-01T00:00:00Z
+const SHOP = process.env.SHOPIFY_SHOP!;
+const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN!;
+const API_VER = process.env.SHOPIFY_API_VERSION || "2024-10";
 
-    const domain = process.env.SHOPIFY_SHOP!;
-    if (!domain) {
-      return NextResponse.json({ ok: false, error: "SHOPIFY_SHOP not set" }, { status: 400 });
+type SfOrder = {
+  id: number;
+  name: string;
+  created_at: string;
+  current_total_price: string;
+  current_total_tax: string;
+  total_discounts: string;
+  // Top-level email Fallback (Shopify hat oft auch order.email)
+  email?: string | null;
+  refunds?: Array<{
+    refund_line_items?: Array<{
+      line_item: {
+        id: number;
+        price: string;
+        sku: string | null;
+        name: string;
+        variant_title: string | null;
+        quantity: number;
+      };
+      quantity: number;
+      subtotal: string;
+      total_tax: string;
+    }>;
+  }>;
+  line_items: Array<{
+    id: number;
+    name: string;
+    variant_title: string | null;
+    sku: string | null;
+    price: string;
+    quantity: number;
+    total_discount: string;
+  }>;
+  customer?: {
+    id?: number | null;
+    email?: string | null;
+    orders_count?: number | null; // WICHTIG für „neu/returning“
+    tags?: string | null;
+  } | null;
+};
+
+async function fetchAllOrders(): Promise<SfOrder[]> {
+  // Felder EXPLIZIT anfordern, damit customer & email sicher dabei sind
+  const fields = [
+    "id",
+    "name",
+    "created_at",
+    "current_total_price",
+    "current_total_tax",
+    "total_discounts",
+    "refunds",
+    "line_items",
+    "email",
+    "customer", // enthält id, email, orders_count, tags …
+  ].join(",");
+
+  const url = `https://${SHOP}/admin/api/${API_VER}/orders.json?status=any&limit=250&fields=${encodeURIComponent(
+    fields
+  )}`;
+
+  const res = await fetch(url, { headers: { "X-Shopify-Access-Token": TOKEN } });
+  if (!res.ok) throw new Error(`Shopify orders fetch failed: ${res.status}`);
+  const data = await res.json();
+  return data.orders as SfOrder[];
+}
+
+// Robuster Kundenschlüssel
+function getCustomerKey(o: SfOrder): { id: string | null; email: string | null } {
+  const id =
+    o.customer?.id != null ? String(o.customer.id) : null;
+  const email = o.customer?.email ?? o.email ?? null;
+  return { id, email };
+}
+
+export async function GET() {
+  try {
+    const shop = await prisma.shop.findFirst({ where: { externalId: SHOP } });
+    if (!shop) {
+      return NextResponse.json(
+        { ok: false, error: "No Shop. Run /api/seed first." },
+        { status: 400 }
+      );
     }
 
-    // 1) Shop idempotent anlegen
-    const shop = await prisma.shop.upsert({
-      where: { externalId: domain },
-      update: {},
-      create: {
-        name: "Nawa Home",
-        domain,
-        externalId: domain,
-      },
-    });
+    const orders = await fetchAllOrders();
 
-    // 2) Orders von Shopify holen (seit ...)
-    const orders = await fetchOrdersSince(since || new Date(Date.now() - 1000 * 60 * 60 * 24 * 60).toISOString()); // default: 60 Tage
+    let created = 0,
+      updated = 0,
+      itemsUpserted = 0;
 
-    let imported = 0;
     for (const o of orders) {
-      const orderExternalId = String(o.id);
+      // Segment aus Tags
+      const tags = (o.customer?.tags || "").toLowerCase();
+      let segment: string | null = null;
+      if (tags.includes("mynt pro plattform")) segment = "platform";
+      else if (tags.includes("mynt pro")) segment = "b2b";
+      else segment = "b2c";
 
-      // Segment über Kundentags (falls vorhanden)
-      const customerTags: string[] = (o.customer?.tags || "")
-        .split(",")
-        .map((s: string) => s.trim())
-        .filter(Boolean);
+      // Returns (Proxy)
+      let returns = 0;
+      if (o.refunds?.length) {
+        for (const r of o.refunds) {
+          if (r.refund_line_items) {
+            for (const rli of r.refund_line_items) {
+              returns += Number(rli.subtotal || 0);
+            }
+          }
+        }
+      }
 
       // Summen
-      const grossSales = toDec(o.current_subtotal_price ?? o.subtotal_price ?? 0); // ohne Tax
-      const discounts = toDec(o.total_discounts ?? 0);
-      const returns = "0.00"; // Refunds später (optional)
-      const netRevenue = toDec(Number(grossSales) - Number(discounts) - Number(returns));
-      const tax = toDec(o.total_tax ?? 0);
-      const total = toDec(o.current_total_price ?? o.total_price ?? 0);
-      const cogs = "0.00"; // optional später map/aus CSV
+      const grossSales =
+        Number(o.current_total_price || 0) - Number(o.current_total_tax || 0);
+      const discounts = Number(o.total_discounts || 0);
+      const tax = Number(o.current_total_tax || 0);
+      const total = Number(o.current_total_price || 0);
+      const netRevenue = grossSales - discounts - returns;
 
-      // 2.1) Order upsert
-      const dbOrder = await prisma.order.upsert({
-        where: { externalId: orderExternalId },
+      // Kunde
+      const { id: custId, email: custEmail } = getCustomerKey(o);
+
+      // „Neu“-Bestimmung: 1) Shopify orders_count, 2) Fallback DB-Min-Datum
+      let isNew: boolean | null = null;
+      if (custId || custEmail) {
+        if (o.customer?.orders_count != null) {
+          // Shopify-Wahrheit: 1 ⇒ erste Bestellung ⇒ „neu“
+          isNew = Number(o.customer.orders_count) <= 1;
+        } else {
+          const firstOrder = await prisma.order.findFirst({
+            where: {
+              shopId: shop.id,
+              OR: [
+                custId ? { customerExternalId: custId } : undefined,
+                custEmail ? { customerEmail: custEmail } : undefined,
+              ].filter(Boolean) as any,
+            },
+            orderBy: { createdAt: "asc" },
+            select: { createdAt: true },
+          });
+          isNew = !firstOrder
+            ? true
+            : new Date(o.created_at) <= firstOrder.createdAt;
+        }
+      }
+
+      // Upsert Order
+      const existing = await prisma.order.findUnique({
+        where: { externalId: String(o.id) },
+      });
+
+      const saved = await prisma.order.upsert({
+        where: { externalId: String(o.id) },
         update: {
-          name: o.name || `#${o.order_number}`,
+          name: o.name,
           createdAt: new Date(o.created_at),
-          segment: ((): string | null => {
-            const seg = classifyLine("", "", customerTags).segment;
-            return seg;
-          })(),
+          segment,
           grossSales,
           discounts,
           returns,
           netRevenue,
           tax,
           total,
-          cogs,
           shopId: shop.id,
+          customerExternalId: custId,
+          customerEmail: custEmail,
+          newCustomer: isNew,
         },
         create: {
-          externalId: orderExternalId,
-          shopId: shop.id,
-          name: o.name || `#${o.order_number}`,
+          externalId: String(o.id),
+          name: o.name,
           createdAt: new Date(o.created_at),
-          segment: classifyLine("", "", customerTags).segment,
+          segment,
           grossSales,
           discounts,
           returns,
           netRevenue,
           tax,
           total,
-          cogs,
+          shopId: shop.id,
+          cogs: 0,
+          customerExternalId: custId,
+          customerEmail: custEmail,
+          newCustomer: isNew,
         },
       });
 
-      // 2.2) Line Items upsert
-      const lines = o.line_items || [];
-      for (const li of lines) {
-        const externalId = String(li.id);
-        const qty = li.quantity ?? 0;
+      if (existing) updated++;
+      else created++;
 
-        const productTitle = li.product_exists === false && li.title ? li.title : li.title || "";
-        const variantTitle = li.variant_title || "";
+      // Items & COGS
+      let orderCogs = 0;
+      for (const li of o.line_items) {
+        const sku = li.sku || null;
+        const price = Number(li.price || 0);
+        const qty = li.quantity ?? 1;
+        const gross = price * qty;
+        const discount = Number(li.total_discount || 0);
+        const net = gross - discount;
 
-        const { category, size } = classifyLine(productTitle, variantTitle, customerTags);
+        let lineCogsPerUnit = 0;
+        if (sku) lineCogsPerUnit = getCOGSForSku(sku) ?? 0;
+        if (!lineCogsPerUnit) {
+          lineCogsPerUnit =
+            getCOGSForFallback(li.name, li.variant_title || "", sku || "") ?? 0;
+        }
 
-        // Zahlen: brutto (ohne Steuer), Rabatt je Zeile, netto, cogs (optional 0)
-        const gross = toDec((Number(li.price ?? 0) * qty) - 0); // Preis*Qty (ohne Rabatte)
-        const discount = toDec(li.total_discount ?? 0);
-        const net = toDec(Number(gross) - Number(discount));
-        const cogsItem = "0.00";
+        const lineCogs = lineCogsPerUnit * qty;
+        orderCogs += lineCogs;
+
+        const { category, size } = classifyCategoryAndSize(
+          li.name,
+          li.variant_title || ""
+        );
 
         await prisma.orderItem.upsert({
-          where: { externalId },
+          where: { externalId: String(li.id) },
           update: {
-            orderId: dbOrder.id,
-            productTitle,
-            variantTitle,
-            sku: li.sku || null,
+            orderId: saved.id,
+            productTitle: li.name,
+            variantTitle: li.variant_title || "",
+            sku,
             quantity: qty,
             gross,
             discount,
             net,
-            cogs: cogsItem,
-            category: category || null,
-            size: size || null,
+            cogs: lineCogs,
+            category,
+            size,
           },
           create: {
-            externalId,
-            orderId: dbOrder.id,
-            productTitle,
-            variantTitle,
-            sku: li.sku || null,
+            externalId: String(li.id),
+            orderId: saved.id,
+            productTitle: li.name,
+            variantTitle: li.variant_title || "",
+            sku,
             quantity: qty,
             gross,
             discount,
             net,
-            cogs: cogsItem,
-            category: category || null,
-            size: size || null,
+            cogs: lineCogs,
+            category,
+            size,
           },
         });
+        itemsUpserted++;
       }
 
-      imported++;
+      await prisma.order.update({
+        where: { id: saved.id },
+        data: { cogs: orderCogs },
+      });
     }
 
-    return NextResponse.json({ ok: true, imported, count: orders.length });
+    return NextResponse.json({ ok: true, created, updated, itemsUpserted });
   } catch (e: any) {
     console.error(e);
-    return NextResponse.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
+    return NextResponse.json({ ok: false, error: e.message }, { status: 500 });
   }
 }

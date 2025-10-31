@@ -14,14 +14,14 @@ datasource db {
  * externalId = Shopify myshopify-Domain (z. B. "nawahome.myshopify.com")
  */
 model Shop {
-  id         String   @id @default(cuid())
-  name       String
-  domain     String?  @unique
-  orders     Order[]
-  createdAt  DateTime @default(now())
+  id        String   @id @default(cuid())
+  name      String
+  domain    String?  @unique
+  orders    Order[]
+  createdAt DateTime @default(now())
 
   /// Shopify Domain als externe ID (idempotent)
-  externalId String?  @unique
+  externalId String? @unique
 }
 
 /**
@@ -29,31 +29,37 @@ model Shop {
  * externalId = Shopify Order-ID (als String)
  */
 model Order {
-  id         String    @id @default(cuid())
-  shop       Shop      @relation(fields: [shopId], references: [id])
-  shopId     String
-  name       String    // z.B. "#1358"
-  createdAt  DateTime  // Bestelldatum
-  segment    String?   // "b2c" | "b2b" | "platform" | "unknown"
+  id        String   @id @default(cuid())
+  shop      Shop     @relation(fields: [shopId], references: [id])
+  shopId    String
+  name      String // z.B. "#1358"
+  createdAt DateTime // Bestelldatum
+  segment   String? // "b2c" | "b2b" | "platform" | "unknown"
 
-  grossSales Decimal   @default(0)  // Bruttoumsatz ohne Steuer
-  discounts  Decimal   @default(0)
-  returns    Decimal   @default(0)
-  netRevenue Decimal   @default(0)  // Nettoumsatz nach Rabatten/Rückgaben
-  tax        Decimal   @default(0)
-  total      Decimal   @default(0)  // Gesamt inkl Steuer
-  cogs       Decimal   @default(0)  // Wareneinsatz / COGS für gesamte Order
+  /// Kundenschlüssel (für Customer-Statistiken)
+  customerExternalId String? // Shopify customer.id als String
+  customerEmail      String? // Fallback, falls customer.id fehlt
+  newCustomer        Boolean? // optional: ob Erstkauf (aus Shopify orders_count==1)
 
-  items      OrderItem[]
+  // Summenfelder
+  grossSales Decimal @default(0) // Bruttoumsatz ohne Steuer
+  discounts  Decimal @default(0)
+  returns    Decimal @default(0)
+  netRevenue Decimal @default(0) // Nettoumsatz nach Rabatten/Rückgaben
+  tax        Decimal @default(0)
+  total      Decimal @default(0) // Gesamt inkl Steuer
+  cogs       Decimal @default(0) // Wareneinsatz / COGS für gesamte Order
 
-  // Flags / Convenience
-  newCustomer Boolean? // optional: ob Erstkauf
+  items OrderItem[]
 
   /// Shopify Order-ID (idempotent)
-  externalId  String   @unique
+  externalId String @unique
 
   @@index([shopId, createdAt])
   @@index([segment])
+  @@index([segment, createdAt])
+  @@index([customerExternalId])
+  @@index([customerEmail])
 }
 
 /**
@@ -61,26 +67,26 @@ model Order {
  * externalId = Shopify line_item.id (als String)
  */
 model OrderItem {
-  id           String  @id @default(cuid())
-  order        Order   @relation(fields: [orderId], references: [id])
-  orderId      String
+  id      String @id @default(cuid())
+  order   Order  @relation(fields: [orderId], references: [id])
+  orderId String
 
   productTitle String
   variantTitle String
   sku          String?
 
-  quantity     Int
-  gross        Decimal @default(0)
-  discount     Decimal @default(0)
-  net          Decimal @default(0)
-  cogs         Decimal @default(0)
+  quantity Int
+  gross    Decimal @default(0)
+  discount Decimal @default(0)
+  net      Decimal @default(0)
+  cogs     Decimal @default(0)
 
   // kategorisierte Felder
-  category     String? // "Wandfarbe", "Lack", "Grundierung", "Farbmuster", Zubehör, etc.
-  size         String? // "1L", "2.5L", "10L", "0.75L", ...
+  category String? // "Wandfarbe", "Lack", "Grundierung", "Farbmuster", Zubehör, etc.
+  size     String? // "1L", "2.5L", "10L", "0.75L", ...
 
   /// Shopify line_item.id (idempotent)
-  externalId   String  @unique
+  externalId String @unique
 
   @@index([orderId])
   @@index([category, size])
